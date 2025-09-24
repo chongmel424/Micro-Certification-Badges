@@ -6,12 +6,22 @@
 (define-constant err-not-owner (err u104))
 (define-constant err-insufficient-badges (err u105))
 (define-constant err-invalid-degree (err u106))
+(define-constant err-assessment-not-found (err u107))
+(define-constant err-already-attempted (err u108))
+(define-constant err-insufficient-score (err u109))
+(define-constant err-not-verified (err u110))
+(define-constant err-already-verified (err u111))
+(define-constant err-cannot-self-verify (err u112))
+(define-constant err-assessment-incomplete (err u113))
 
 (define-non-fungible-token micro-badge uint)
 (define-non-fungible-token degree-certificate uint)
 
 (define-data-var last-badge-id uint u0)
 (define-data-var last-degree-id uint u0)
+(define-data-var last-assessment-id uint u0)
+(define-data-var total-assessments-completed uint u0)
+(define-data-var total-verifications uint u0)
 
 (define-map teachers principal bool)
 (define-map badge-data uint {
@@ -35,6 +45,39 @@
 (define-map student-badges principal (list 50 uint))
 (define-map student-degrees principal (list 10 uint))
 (define-map badge-subjects (string-ascii 30) (list 100 uint))
+
+(define-map skill-assessments uint {
+    title: (string-ascii 50),
+    subject: (string-ascii 30),
+    description: (string-ascii 200),
+    created-by: principal,
+    min-score: uint,
+    max-score: uint,
+    verification-required: bool,
+    created-at: uint,
+    active: bool
+})
+
+(define-map assessment-attempts {student: principal, assessment-id: uint} {
+    score: uint,
+    completed-at: uint,
+    verified: bool,
+    verification-count: uint,
+    passed: bool
+})
+
+(define-map peer-verifications {student: principal, assessment-id: uint, verifier: principal} {
+    verified: bool,
+    verification-score: uint,
+    verified-at: uint
+})
+
+(define-map student-reputation principal {
+    verification-count: uint,
+    verified-by-count: uint,
+    assessment-success-rate: uint,
+    total-assessments: uint
+})
 
 (define-read-only (get-last-token-id)
     (ok (var-get last-badge-id))
@@ -235,6 +278,209 @@
         total-degrees: (var-get last-degree-id),
         contract-owner: contract-owner
     }
+)
+
+(define-public (create-skill-assessment (title (string-ascii 50)) (subject (string-ascii 30)) (description (string-ascii 200)) (min-score uint) (max-score uint) (verification-required bool))
+    (let (
+        (assessment-id (+ (var-get last-assessment-id) u1))
+    )
+        (asserts! (default-to false (map-get? teachers tx-sender)) err-not-teacher)
+        (asserts! (> max-score min-score) err-invalid-degree)
+        
+        (map-set skill-assessments assessment-id {
+            title: title,
+            subject: subject,
+            description: description,
+            created-by: tx-sender,
+            min-score: min-score,
+            max-score: max-score,
+            verification-required: verification-required,
+            created-at: stacks-block-height,
+            active: true
+        })
+        
+        (var-set last-assessment-id assessment-id)
+        (ok assessment-id)
+    )
+)
+
+(define-public (submit-assessment-attempt (assessment-id uint) (score uint))
+    (let (
+        (assessment-data (unwrap! (map-get? skill-assessments assessment-id) err-assessment-not-found))
+        (attempt-key {student: tx-sender, assessment-id: assessment-id})
+        (existing-attempt (map-get? assessment-attempts attempt-key))
+        (student-rep (default-to {verification-count: u0, verified-by-count: u0, assessment-success-rate: u0, total-assessments: u0} 
+                       (map-get? student-reputation tx-sender)))
+    )
+        (asserts! (get active assessment-data) err-assessment-not-found)
+        (asserts! (is-none existing-attempt) err-already-attempted)
+        (asserts! (<= score (get max-score assessment-data)) err-invalid-degree)
+        
+        (let (
+            (passed (>= score (get min-score assessment-data)))
+            (needs-verification (and passed (get verification-required assessment-data)))
+        )
+            (map-set assessment-attempts attempt-key {
+                score: score,
+                completed-at: stacks-block-height,
+                verified: (not needs-verification),
+                verification-count: u0,
+                passed: passed
+            })
+            
+            (map-set student-reputation tx-sender {
+                verification-count: (get verification-count student-rep),
+                verified-by-count: (get verified-by-count student-rep),
+                assessment-success-rate: (if (> (+ (get total-assessments student-rep) u1) u0)
+                    (/ (* (+ (if passed u1 u0) (* (get assessment-success-rate student-rep) (get total-assessments student-rep))) u100)
+                       (+ (get total-assessments student-rep) u1))
+                    u0),
+                total-assessments: (+ (get total-assessments student-rep) u1)
+            })
+            
+            (var-set total-assessments-completed (+ (var-get total-assessments-completed) u1))
+            (ok passed)
+        )
+    )
+)
+
+(define-public (verify-peer-assessment (student principal) (assessment-id uint) (verification-score uint) (approve bool))
+    (let (
+        (assessment-data (unwrap! (map-get? skill-assessments assessment-id) err-assessment-not-found))
+        (attempt-key {student: student, assessment-id: assessment-id})
+        (attempt-data (unwrap! (map-get? assessment-attempts attempt-key) err-assessment-not-found))
+        (verification-key {student: student, assessment-id: assessment-id, verifier: tx-sender})
+        (existing-verification (map-get? peer-verifications verification-key))
+        (verifier-rep (default-to {verification-count: u0, verified-by-count: u0, assessment-success-rate: u0, total-assessments: u0}
+                        (map-get? student-reputation tx-sender)))
+        (student-rep (default-to {verification-count: u0, verified-by-count: u0, assessment-success-rate: u0, total-assessments: u0}
+                       (map-get? student-reputation student)))
+    )
+        (asserts! (not (is-eq student tx-sender)) err-cannot-self-verify)
+        (asserts! (get passed attempt-data) err-assessment-incomplete)
+        (asserts! (get verification-required assessment-data) err-not-verified)
+        (asserts! (is-none existing-verification) err-already-verified)
+        
+        (map-set peer-verifications verification-key {
+            verified: approve,
+            verification-score: verification-score,
+            verified-at: stacks-block-height
+        })
+        
+        (let (
+            (new-verification-count (+ (get verification-count attempt-data) u1))
+            (is-fully-verified (>= new-verification-count u3))
+        )
+            (map-set assessment-attempts attempt-key
+                (merge attempt-data {
+                    verification-count: new-verification-count,
+                    verified: is-fully-verified
+                })
+            )
+            
+            (map-set student-reputation tx-sender
+                (merge verifier-rep {
+                    verification-count: (+ (get verification-count verifier-rep) u1)
+                })
+            )
+            
+            (map-set student-reputation student
+                (merge student-rep {
+                    verified-by-count: (+ (get verified-by-count student-rep) u1)
+                })
+            )
+            
+            (var-set total-verifications (+ (var-get total-verifications) u1))
+            (ok is-fully-verified)
+        )
+    )
+)
+
+(define-public (issue-badge-with-assessment (student principal) (title (string-ascii 50)) (subject (string-ascii 30)) (description (string-ascii 200)) (assessment-id uint))
+    (let (
+        (assessment-data (unwrap! (map-get? skill-assessments assessment-id) err-assessment-not-found))
+        (attempt-key {student: student, assessment-id: assessment-id})
+        (attempt-data (unwrap! (map-get? assessment-attempts attempt-key) err-assessment-not-found))
+        (badge-id (+ (var-get last-badge-id) u1))
+        (current-badges (default-to (list) (map-get? student-badges student)))
+        (subject-badges (default-to (list) (map-get? badge-subjects subject)))
+    )
+        (asserts! (default-to false (map-get? teachers tx-sender)) err-not-teacher)
+        (asserts! (get passed attempt-data) err-insufficient-score)
+        (asserts! (get verified attempt-data) err-not-verified)
+        
+        (try! (nft-mint? micro-badge badge-id student))
+        (map-set badge-data badge-id {
+            title: title,
+            subject: subject,
+            description: description,
+            issued-to: student,
+            issued-by: tx-sender,
+            issued-at: stacks-block-height
+        })
+        (map-set student-badges student (unwrap-panic (as-max-len? (append current-badges badge-id) u50)))
+        (map-set badge-subjects subject (unwrap-panic (as-max-len? (append subject-badges badge-id) u100)))
+        (var-set last-badge-id badge-id)
+        (ok badge-id)
+    )
+)
+
+(define-read-only (get-skill-assessment (assessment-id uint))
+    (map-get? skill-assessments assessment-id)
+)
+
+(define-read-only (get-assessment-attempt (student principal) (assessment-id uint))
+    (map-get? assessment-attempts {student: student, assessment-id: assessment-id})
+)
+
+(define-read-only (get-peer-verification (student principal) (assessment-id uint) (verifier principal))
+    (map-get? peer-verifications {student: student, assessment-id: assessment-id, verifier: verifier})
+)
+
+(define-read-only (get-student-reputation (student principal))
+    (default-to {verification-count: u0, verified-by-count: u0, assessment-success-rate: u0, total-assessments: u0}
+                (map-get? student-reputation student))
+)
+
+(define-read-only (get-assessment-stats)
+    {
+        total-assessments: (var-get last-assessment-id),
+        total-completions: (var-get total-assessments-completed),
+        total-verifications: (var-get total-verifications),
+        completion-rate: (if (> (var-get last-assessment-id) u0)
+            (/ (* (var-get total-assessments-completed) u100) (var-get last-assessment-id))
+            u0)
+    }
+)
+
+(define-read-only (check-badge-eligibility (student principal) (assessment-id uint))
+    (match (map-get? assessment-attempts {student: student, assessment-id: assessment-id})
+        attempt-data {
+            passed: (get passed attempt-data),
+            verified: (get verified attempt-data),
+            eligible-for-badge: (and (get passed attempt-data) (get verified attempt-data))
+        }
+        {
+            passed: false,
+            verified: false,
+            eligible-for-badge: false
+        }
+    )
+)
+
+(define-read-only (get-verification-progress (student principal) (assessment-id uint))
+    (match (map-get? assessment-attempts {student: student, assessment-id: assessment-id})
+        attempt-data {
+            verification-count: (get verification-count attempt-data),
+            required-verifications: u3,
+            is-verified: (get verified attempt-data)
+        }
+        {
+            verification-count: u0,
+            required-verifications: u3,
+            is-verified: false
+        }
+    )
 )
 
 (register-teacher contract-owner)
