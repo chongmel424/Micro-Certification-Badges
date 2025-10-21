@@ -13,6 +13,9 @@
 (define-constant err-already-verified (err u111))
 (define-constant err-cannot-self-verify (err u112))
 (define-constant err-assessment-incomplete (err u113))
+(define-constant err-badge-expired (err u114))
+(define-constant err-badge-still-valid (err u115))
+(define-constant err-no-expiration (err u116))
 
 (define-non-fungible-token micro-badge uint)
 (define-non-fungible-token degree-certificate uint)
@@ -22,6 +25,7 @@
 (define-data-var last-assessment-id uint u0)
 (define-data-var total-assessments-completed uint u0)
 (define-data-var total-verifications uint u0)
+(define-data-var total-renewals uint u0)
 
 (define-map teachers principal bool)
 (define-map badge-data uint {
@@ -77,6 +81,21 @@
     verified-by-count: uint,
     assessment-success-rate: uint,
     total-assessments: uint
+})
+
+(define-map badge-expiration uint {
+    expires-at: uint,
+    validity-period: uint,
+    renewable: bool,
+    renewal-count: uint,
+    last-renewed-at: (optional uint)
+})
+
+(define-map badge-renewals {badge-id: uint, renewal-number: uint} {
+    renewed-at: uint,
+    renewed-by: principal,
+    previous-expiry: uint,
+    new-expiry: uint
 })
 
 (define-read-only (get-last-token-id)
@@ -480,6 +499,183 @@
             required-verifications: u3,
             is-verified: false
         }
+    )
+)
+
+(define-public (set-badge-expiration (badge-id uint) (validity-period uint) (renewable bool))
+    (let (
+        (badge-info (unwrap! (map-get? badge-data badge-id) err-not-found))
+        (expiry-block (+ stacks-block-height validity-period))
+    )
+        (asserts! (default-to false (map-get? teachers tx-sender)) err-not-teacher)
+        (asserts! (> validity-period u0) err-invalid-degree)
+        
+        (map-set badge-expiration badge-id {
+            expires-at: expiry-block,
+            validity-period: validity-period,
+            renewable: renewable,
+            renewal-count: u0,
+            last-renewed-at: none
+        })
+        (ok expiry-block)
+    )
+)
+
+(define-public (renew-badge (badge-id uint))
+    (let (
+        (badge-info (unwrap! (map-get? badge-data badge-id) err-not-found))
+        (expiration-info (unwrap! (map-get? badge-expiration badge-id) err-no-expiration))
+        (badge-owner (unwrap! (nft-get-owner? micro-badge badge-id) err-not-found))
+    )
+        (asserts! (or 
+            (is-eq tx-sender badge-owner)
+            (default-to false (map-get? teachers tx-sender)))
+            err-not-owner)
+        (asserts! (get renewable expiration-info) err-invalid-degree)
+        (asserts! (>= stacks-block-height (get expires-at expiration-info)) err-badge-still-valid)
+        
+        (let (
+            (new-expiry (+ stacks-block-height (get validity-period expiration-info)))
+            (current-renewal-count (get renewal-count expiration-info))
+            (renewal-number (+ current-renewal-count u1))
+        )
+            (map-set badge-renewals {badge-id: badge-id, renewal-number: renewal-number} {
+                renewed-at: stacks-block-height,
+                renewed-by: tx-sender,
+                previous-expiry: (get expires-at expiration-info),
+                new-expiry: new-expiry
+            })
+            
+            (map-set badge-expiration badge-id
+                (merge expiration-info {
+                    expires-at: new-expiry,
+                    renewal-count: renewal-number,
+                    last-renewed-at: (some stacks-block-height)
+                })
+            )
+            
+            (var-set total-renewals (+ (var-get total-renewals) u1))
+            (ok new-expiry)
+        )
+    )
+)
+
+(define-public (issue-badge-with-expiration (student principal) (title (string-ascii 50)) (subject (string-ascii 30)) (description (string-ascii 200)) (validity-period uint))
+    (let (
+        (badge-id (+ (var-get last-badge-id) u1))
+        (current-badges (default-to (list) (map-get? student-badges student)))
+        (subject-badges (default-to (list) (map-get? badge-subjects subject)))
+        (expiry-block (+ stacks-block-height validity-period))
+    )
+        (asserts! (default-to false (map-get? teachers tx-sender)) err-not-teacher)
+        (asserts! (> validity-period u0) err-invalid-degree)
+        (try! (nft-mint? micro-badge badge-id student))
+        
+        (map-set badge-data badge-id {
+            title: title,
+            subject: subject,
+            description: description,
+            issued-to: student,
+            issued-by: tx-sender,
+            issued-at: stacks-block-height
+        })
+        
+        (map-set badge-expiration badge-id {
+            expires-at: expiry-block,
+            validity-period: validity-period,
+            renewable: true,
+            renewal-count: u0,
+            last-renewed-at: none
+        })
+        
+        (map-set student-badges student (unwrap-panic (as-max-len? (append current-badges badge-id) u50)))
+        (map-set badge-subjects subject (unwrap-panic (as-max-len? (append subject-badges badge-id) u100)))
+        (var-set last-badge-id badge-id)
+        (ok badge-id)
+    )
+)
+
+(define-read-only (get-badge-expiration-info (badge-id uint))
+    (map-get? badge-expiration badge-id)
+)
+
+(define-read-only (is-badge-expired (badge-id uint))
+    (match (map-get? badge-expiration badge-id)
+        expiration-info (ok (>= stacks-block-height (get expires-at expiration-info)))
+        err-no-expiration
+    )
+)
+
+(define-read-only (get-badge-status (badge-id uint))
+    (match (map-get? badge-expiration badge-id)
+        expiration-info 
+            (let (
+                (is-expired (>= stacks-block-height (get expires-at expiration-info)))
+                (blocks-remaining (if is-expired u0 (- (get expires-at expiration-info) stacks-block-height)))
+            )
+                (ok {
+                    is-expired: is-expired,
+                    expires-at: (get expires-at expiration-info),
+                    blocks-remaining: blocks-remaining,
+                    renewable: (get renewable expiration-info),
+                    renewal-count: (get renewal-count expiration-info),
+                    validity-period: (get validity-period expiration-info)
+                })
+            )
+        (ok {
+            is-expired: false,
+            expires-at: u0,
+            blocks-remaining: u0,
+            renewable: false,
+            renewal-count: u0,
+            validity-period: u0
+        })
+    )
+)
+
+(define-read-only (get-renewal-history (badge-id uint) (renewal-number uint))
+    (map-get? badge-renewals {badge-id: badge-id, renewal-number: renewal-number})
+)
+
+(define-read-only (count-badge-renewals (badge-id uint))
+    (match (map-get? badge-expiration badge-id)
+        expiration-info (ok (get renewal-count expiration-info))
+        err-no-expiration
+    )
+)
+
+(define-read-only (get-expiring-soon (badge-id uint) (threshold-blocks uint))
+    (match (map-get? badge-expiration badge-id)
+        expiration-info
+            (let (
+                (blocks-until-expiry (if (>= stacks-block-height (get expires-at expiration-info))
+                    u0
+                    (- (get expires-at expiration-info) stacks-block-height)))
+            )
+                (ok {
+                    expiring-soon: (and 
+                        (< blocks-until-expiry threshold-blocks)
+                        (> blocks-until-expiry u0)),
+                    blocks-until-expiry: blocks-until-expiry,
+                    renewable: (get renewable expiration-info)
+                })
+            )
+        err-no-expiration
+    )
+)
+
+(define-read-only (get-total-renewals)
+    (var-get total-renewals)
+)
+
+(define-read-only (get-student-active-badges (student principal))
+    (let (
+        (all-badges (get-student-badges student))
+    )
+        (ok {
+            total-badges: (len all-badges),
+            badge-ids: all-badges
+        })
     )
 )
 
