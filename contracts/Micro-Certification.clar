@@ -16,6 +16,8 @@
 (define-constant err-badge-expired (err u114))
 (define-constant err-badge-still-valid (err u115))
 (define-constant err-no-expiration (err u116))
+(define-constant err-already-revoked (err u117))
+(define-constant err-not-issuer (err u118))
 
 (define-non-fungible-token micro-badge uint)
 (define-non-fungible-token degree-certificate uint)
@@ -26,6 +28,7 @@
 (define-data-var total-assessments-completed uint u0)
 (define-data-var total-verifications uint u0)
 (define-data-var total-renewals uint u0)
+(define-data-var total-revocations uint u0)
 
 (define-map teachers principal bool)
 (define-map badge-data uint {
@@ -677,6 +680,42 @@
             badge-ids: all-badges
         })
     )
+)
+
+(define-map badge-revocations uint {
+    revoked-by: principal,
+    reason: (string-ascii 100),
+    revoked-at: uint
+})
+
+(define-public (revoke-badge (badge-id uint) (reason (string-ascii 100)))
+    (let (
+        (badge-info (unwrap! (map-get? badge-data badge-id) err-not-found))
+        (badge-owner (unwrap! (nft-get-owner? micro-badge badge-id) err-not-found))
+    )
+        (asserts! (or (is-eq tx-sender contract-owner) (is-eq tx-sender (get issued-by badge-info))) err-not-issuer)
+        (asserts! (is-none (map-get? badge-revocations badge-id)) err-already-revoked)
+        (try! (nft-burn? micro-badge badge-id badge-owner))
+        (map-set badge-revocations badge-id {
+            revoked-by: tx-sender,
+            reason: reason,
+            revoked-at: stacks-block-height
+        })
+        (var-set total-revocations (+ (var-get total-revocations) u1))
+        (ok true)
+    )
+)
+
+(define-read-only (is-badge-revoked (badge-id uint))
+    (is-some (map-get? badge-revocations badge-id))
+)
+
+(define-read-only (get-revocation-info (badge-id uint))
+    (map-get? badge-revocations badge-id)
+)
+
+(define-read-only (get-total-revocations)
+    (var-get total-revocations)
 )
 
 (register-teacher contract-owner)
